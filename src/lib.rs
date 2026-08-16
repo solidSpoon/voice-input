@@ -74,17 +74,19 @@ pub extern "C" fn vi_init() -> i32 {
     let cfg = match config::Config::load() {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("加载配置失败: {e:#}");
+            crate::logger::debug(&format!("vi_init: 加载配置失败: {e:#}"));
             return -1;
         }
     };
     if cfg.asr.api_key.is_empty() {
-        eprintln!("提示: 尚未配置 API Key，请编辑 ~/.config/voice-input/config.toml 后重启 fcitx5。");
+        crate::logger::debug(
+            "vi_init: 尚未配置 API Key，请编辑 ~/.config/voice-input/config.toml 后重启 fcitx5。",
+        );
     }
     let rt = match tokio::runtime::Runtime::new() {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("创建 tokio runtime 失败: {e}");
+            crate::logger::debug(&format!("vi_init: 创建 tokio runtime 失败: {e}"));
             return -2;
         }
     };

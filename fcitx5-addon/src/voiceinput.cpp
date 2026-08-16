@@ -28,7 +28,6 @@
 #include <fcitx/text.h>
 #include <fcitx/userinterface.h>
 
-#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -147,24 +146,31 @@ private:
         }
         const Key key = keyEvent.key();
         // 热键：按住右 Ctrl 说话，TODO: 做成可配置
-        const bool hotkeyPress = key.check(Key(FcitxKey_Control_R));
+        const bool isCtrlR = key.check(Key(FcitxKey_Control_R));
 
-        if (hotkeyPress && !keyEvent.isRelease()) {
-            if (!recording_ && vi_state() == 0) {
-                recording_ = true;
-                pendingIcUuid_ = ic->uuid();
-                int rc = vi_start();
-                viLog("按键: 按下右 Ctrl 开始录音 rc=" + std::to_string(rc));
-                setAux(ic, "🎤 录音中…");
+        if (isCtrlR) {
+            if (!keyEvent.isRelease()) {
+                // 按下：开始录音（含自动重复的 press，一律吞掉不外泄）
+                if (!recording_ && vi_state() == 0) {
+                    recording_ = true;
+                    recordingStart_ = std::chrono::steady_clock::now();
+                    pendingIcUuid_ = ic->uuid();
+                    int rc = vi_start();
+                    viLog("按键: 按下右 Ctrl 开始录音 rc=" +
+                          std::to_string(rc));
+                    setAux(ic, "🎤 录音中…");
+                }
                 keyEvent.filterAndAccept();
                 return true;
             }
-        } else if (recording_ &&
-                   key.isReleaseOfModifier(Key(FcitxKey_Control_R))) {
-            recording_ = false;
-            int rc = vi_stop();
-            viLog("按键: 松开右 Ctrl 停止录音 rc=" + std::to_string(rc));
-            setAux(ic, "🔍 识别中…");
+            // 松开
+            if (recording_ &&
+                key.isReleaseOfModifier(Key(FcitxKey_Control_R))) {
+                recording_ = false;
+                int rc = vi_stop();
+                viLog("按键: 松开右 Ctrl 停止录音 rc=" + std::to_string(rc));
+                setAux(ic, "🔍 识别中…");
+            }
             keyEvent.filterAndAccept();
             return true;
         }
@@ -184,6 +190,22 @@ private:
 
     // 主线程定时器：把缓冲里的结果提交到输入上下文
     void pollResult() {
+        // 安全网：松开 Ctrl 事件丢失（焦点切换/应用抢键）时强制停止，
+        // 避免录音无限继续、麦克风常开
+        if (recording_ &&
+            std::chrono::steady_clock::now() - recordingStart_ >
+                std::chrono::seconds(MAX_RECORD_SECS)) {
+            viLog("安全超时: " + std::to_string(MAX_RECORD_SECS) +
+                  " 秒未收到松开 Ctrl，强制停止录音");
+            recording_ = false;
+            vi_stop();
+            auto *ic =
+                instance_->inputContextManager().findByUUID(pendingIcUuid_);
+            if (ic) {
+                setAux(ic, ""); // 清掉“录音中…”
+            }
+        }
+
         std::string text;
         {
             std::lock_guard<std::mutex> lock(resultMutex_);
@@ -218,7 +240,9 @@ private:
     std::mutex resultMutex_;
     std::string resultBuffer_;
     bool recording_ = false;
+    std::chrono::steady_clock::time_point recordingStart_{};
     ICUUID pendingIcUuid_{};
+    static constexpr int MAX_RECORD_SECS = 60;
 };
 
 class VoiceInputFactory : public AddonFactory {
