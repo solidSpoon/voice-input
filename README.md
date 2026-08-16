@@ -82,9 +82,10 @@ API Key 在[火山引擎控制台](https://console.volcengine.com/speech/new/set
 
 ## 使用
 
-- 按住 Ctrl（左右均可）说话，松开后识别结果出现在当前输入位置
+- 按住**右 Ctrl** 说话，松开后识别结果出现在当前输入位置；录音/识别中候选框旁有状态提示
 - 热键暂为硬编码，TODO：做成 fcitx5 配置项
-- 调试日志：`~/.local/share/voice-input/debug.log`
+- 调试日志：`~/.local/share/voice-input/debug.log`（Rust 核心）、`plugin.log`（插件）
+- 日志保留策略：只留最近 **7 天**，单文件超 **1MB** 自动轮转到 `.1`（每小时检查一次）
 
 ## 说明
 

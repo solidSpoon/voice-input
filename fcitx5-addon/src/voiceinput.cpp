@@ -2,7 +2,7 @@
 //
 // voice-input fcitx5 插件
 //
-// 按住右/左 Ctrl 说话，松开后把识别结果以 commitString 提交到当前输入上下文。
+// 按住右 Ctrl 说话，松开后把识别结果以 commitString 提交到当前输入上下文。
 //
 // 线程模型：
 // - 热键触发/按键吞掉/文本提交都在 fcitx5 主线程（watchEvent 回调）
@@ -11,6 +11,9 @@
 // - 主线程 100ms 定时器轮询缓冲（sd-event 定时器单次触发，需重挂），有结果就
 //   commitString（不依赖跨线程唤醒，简单可靠）
 
+#include <atomic>
+#include <chrono>
+#include <ctime>
 #include <fcitx-utils/event.h>
 #include <fcitx-utils/handlertable.h>
 #include <fcitx-utils/key.h>
@@ -40,6 +43,7 @@ namespace fcitx {
 namespace {
 
 // 简易日志：~/.local/share/voice-input/plugin.log（fcitx5 的 stderr 不可见）
+// 保留策略：只留最近 7 天（*.log*），单文件超过 1MB 轮转到 .1，每小时清理一次
 void viLog(const std::string &msg) {
     const char *home = getenv("HOME");
     if (!home) {
@@ -49,7 +53,42 @@ void viLog(const std::string &msg) {
         std::filesystem::path(home) / ".local" / "share" / "voice-input";
     std::error_code ec;
     std::filesystem::create_directories(dir, ec);
-    FILE *f = fopen((dir / "plugin.log").c_str(), "a");
+
+    static std::atomic<uint64_t> lastCleanup{0};
+    uint64_t nowSecs = static_cast<uint64_t>(time(nullptr));
+    if (nowSecs - lastCleanup.load(std::memory_order_relaxed) >= 3600) {
+        lastCleanup.store(nowSecs, std::memory_order_relaxed);
+        // 删除超过 7 天的日志文件
+        auto cutoff = std::chrono::hours(7 * 24);
+        for (auto &entry : std::filesystem::directory_iterator(dir, ec)) {
+            std::string name = entry.path().filename().string();
+            if (name.rfind("debug.log", 0) != 0 &&
+                name.rfind("plugin.log", 0) != 0) {
+                continue;
+            }
+            auto ftime = entry.last_write_time(ec);
+            if (ec) {
+                ec.clear();
+                continue;
+            }
+            if (std::filesystem::file_time_type::clock::now() - ftime >
+                cutoff) {
+                std::filesystem::remove(entry.path(), ec);
+                ec.clear();
+            }
+        }
+    }
+
+    std::filesystem::path file = dir / "plugin.log";
+    // 超过 1MB 轮转到 .1（POSIX rename 直接覆盖旧 .1）
+    if (std::filesystem::exists(file, ec) &&
+        std::filesystem::file_size(file, ec) > (1u << 20)) {
+        ec.clear();
+        std::filesystem::rename(file, dir / "plugin.log.1", ec);
+        ec.clear();
+    }
+
+    FILE *f = fopen(file.c_str(), "a");
     if (f) {
         fprintf(f, "%s\n", msg.c_str());
         fclose(f);
