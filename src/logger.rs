@@ -20,12 +20,7 @@ fn log_path() -> PathBuf {
 }
 
 fn now_str() -> String {
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let (h, m, s) = ((secs / 3600) % 24, (secs / 60) % 60, secs % 60);
-    format!("{h:02}:{m:02}:{s:02}")
+    chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
 /// 初始化：写启动分隔头（带轮次编号）。
@@ -67,7 +62,9 @@ fn cleanup_if_due() {
             continue;
         }
         let Ok(meta) = entry.metadata() else { continue };
-        let Ok(modified) = meta.modified() else { continue };
+        let Ok(modified) = meta.modified() else {
+            continue;
+        };
         let Ok(age) = SystemTime::now().duration_since(modified) else {
             continue;
         };
@@ -90,10 +87,11 @@ fn append(path: &PathBuf, content: &str) {
     }
 }
 
-/// 写一行日志：stderr + 文件，并顺手触发保留策略清理。
+/// 写一行带本地时间的日志：stderr + 文件，并顺手触发保留策略清理。
 pub fn debug(msg: &str) {
-    eprintln!("{msg}");
+    let line = format!("[{}] {msg}", now_str());
+    eprintln!("{line}");
     let path = log_path();
     cleanup_if_due();
-    append(&path, &format!("{msg}\n"));
+    append(&path, &format!("{line}\n"));
 }

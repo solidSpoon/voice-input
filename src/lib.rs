@@ -24,7 +24,7 @@ mod ws;
 
 use std::ffi::{c_char, CString};
 use std::os::raw::c_void;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 /// 识别结果回调：`text` 为 UTF-8，仅回调期间有效；失败/空结果时为 NULL。
 pub type ViCallback = extern "C" fn(text: *const c_char, user_data: *mut c_void);
@@ -42,14 +42,17 @@ struct CbUserData(*mut c_void);
 // Safety: 指针只是不透明 token，由 C++ 侧负责其线程安全
 unsafe impl Send for CbUserData {}
 
+struct CallbackState(Mutex<Option<(ViCallback, CbUserData)>>);
+
 struct Engine {
     cfg: config::Config,
     rt: tokio::runtime::Runtime,
     audio_tx: Option<tokio::sync::mpsc::Sender<Vec<i16>>>,
     stop_tx: Option<std::sync::mpsc::Sender<()>>,
+    asr_task: Option<tokio::task::JoinHandle<()>>,
+    recorder_thread: Option<std::thread::JoinHandle<()>>,
     state: State,
-    cb: Option<ViCallback>,
-    user_data: CbUserData,
+    callback: Arc<CallbackState>,
 }
 
 /// 未初始化时暂存回调，vi_init 时取用（避免“先 set 后 init”被丢弃）
@@ -66,11 +69,15 @@ fn engine() -> &'static Mutex<Option<Engine>> {
 }
 
 /// 初始化：加载配置、创建 tokio runtime、初始化日志。
-/// 返回 0 成功；-1 配置缺失/错误；-2 runtime 创建失败。
+/// 返回 0 成功；-1 配置缺失/错误；-2 runtime 创建失败；-3 已初始化。
 #[no_mangle]
 pub extern "C" fn vi_init() -> i32 {
     let _ = rustls::crypto::ring::default_provider().install_default();
     logger::init();
+    if lock_engine().is_some() {
+        crate::logger::debug("vi_init: 已初始化 (-3)");
+        return -3;
+    }
     let cfg = match config::Config::load() {
         Ok(c) => c,
         Err(e) => {
@@ -91,35 +98,54 @@ pub extern "C" fn vi_init() -> i32 {
         }
     };
     // 取用 init 前暂存的回调（若有）
-    let (cb, user_data) = match PENDING_CB
+    let cb = PENDING_CB
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .take()
-    {
-        Some((cb, ud)) => (cb, ud),
-        None => (None, CbUserData(std::ptr::null_mut())),
-    };
+        .and_then(|(cb, ud)| cb.map(|callback| (callback, ud)));
+    let callback = Arc::new(CallbackState(Mutex::new(cb)));
     *lock_engine() = Some(Engine {
         cfg,
         rt,
         audio_tx: None,
         stop_tx: None,
+        asr_task: None,
+        recorder_thread: None,
         state: State::Idle,
-        cb,
-        user_data,
+        callback,
     });
-    crate::logger::debug(&format!("vi_init: 完成 (callback={})", if cb.is_some() { "已注册" } else { "未注册" }));
+    crate::logger::debug(&format!(
+        "vi_init: 完成 (callback={})",
+        if cb.is_some() {
+            "已注册"
+        } else {
+            "未注册"
+        }
+    ));
     0
 }
 
 /// 释放核心库状态。返回 0 成功；-1 未初始化。
 #[no_mangle]
 pub extern "C" fn vi_shutdown() -> i32 {
-    let mut guard = lock_engine();
-    if guard.is_none() {
+    let Some(mut eng) = lock_engine().take() else {
         return -1;
+    };
+
+    // 先禁止回调，再停止任务和录音线程，保证 user_data 不会指向已析构的对象。
+    *eng.callback.0.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    if let Some(tx) = eng.stop_tx.take() {
+        let _ = tx.send(());
     }
-    *guard = None;
+    eng.audio_tx.take();
+    if let Some(task) = eng.asr_task.take() {
+        task.abort();
+    }
+    let recorder_thread = eng.recorder_thread.take();
+    drop(eng); // Runtime 被释放时会取消仍在运行的 ASR 任务
+    if let Some(thread) = recorder_thread {
+        let _ = thread.join();
+    }
     0
 }
 
@@ -127,8 +153,11 @@ pub extern "C" fn vi_shutdown() -> i32 {
 #[no_mangle]
 pub extern "C" fn vi_set_callback(cb: Option<ViCallback>, user_data: *mut c_void) {
     if let Some(e) = lock_engine().as_mut() {
-        e.cb = cb;
-        e.user_data = CbUserData(user_data);
+        *e.callback
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            cb.map(|callback| (callback, CbUserData(user_data)));
     } else {
         // 引擎未就绪：暂存，等 vi_init 消费
         *PENDING_CB.lock().unwrap_or_else(|e| e.into_inner()) = Some((cb, CbUserData(user_data)));
@@ -147,7 +176,13 @@ pub extern "C" fn vi_start() -> i32 {
         crate::logger::debug(&format!("vi_start: 状态不允许 ({:?}) (-2)", eng.state));
         return -2;
     }
-    if eng.cb.is_none() {
+    if eng
+        .callback
+        .0
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_none()
+    {
         crate::logger::debug("vi_start: 警告 - 回调未注册，识别结果将丢弃");
     }
     crate::logger::debug("vi_start: 开始录音");
@@ -156,35 +191,33 @@ pub extern "C" fn vi_start() -> i32 {
     let (audio_tx, audio_rx) = tokio::sync::mpsc::channel::<Vec<i16>>(64);
     let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
 
-    // ASR 任务：在 tokio runtime 上消费音频，结束后触发回调
     let client = asr::AsrClient::new(&eng.cfg.asr);
-    let cb = eng.cb;
-    let user_data = eng.user_data;
+    let callback = Arc::clone(&eng.callback);
     let rt = eng.rt.handle().clone();
-    rt.spawn(async move {
+    eng.asr_task = Some(rt.spawn(async move {
         let res = client.transcribe(audio_rx).await;
         crate::logger::debug("ASR 任务: transcribe 返回，准备回调");
-        deliver_result(&cb, user_data, &res);
+        deliver_result(&callback, &res);
         crate::logger::debug("ASR 任务: 回调已返回");
-        // 回到 Idle（若仍在 Waiting）
+        // 无论是正常停止还是连接/录音提前失败，都完成当前操作。
         let mut g = lock_engine();
         if let Some(e) = g.as_mut() {
-            if e.state == State::Waiting {
+            if e.state != State::Idle {
                 e.state = State::Idle;
                 crate::logger::debug("ASR 任务: 状态回到 Idle");
             }
         }
-    });
+    }));
 
     // 录音线程：阻塞采集；音频通道关闭（发送端全部 drop）时 ASR 收到结束
     let rate = eng.cfg.asr.rate;
     eng.audio_tx = Some(audio_tx.clone());
     eng.stop_tx = Some(stop_tx);
-    std::thread::spawn(move || {
+    eng.recorder_thread = Some(std::thread::spawn(move || {
         if let Err(e) = recorder::record(rate, audio_tx, stop_rx) {
-            eprintln!("录音错误: {e:#}");
+            crate::logger::debug(&format!("录音错误: {e:#}"));
         }
-    });
+    }));
     0
 }
 
@@ -220,8 +253,9 @@ pub extern "C" fn vi_state() -> i32 {
     }
 }
 
-fn deliver_result(cb: &Option<ViCallback>, user_data: CbUserData, res: &anyhow::Result<String>) {
-    let Some(cb) = cb else {
+fn deliver_result(callback: &CallbackState, res: &anyhow::Result<String>) {
+    let callback_guard = callback.0.lock().unwrap_or_else(|e| e.into_inner());
+    let Some((cb, user_data)) = callback_guard.as_ref().copied() else {
         return;
     };
     match res {

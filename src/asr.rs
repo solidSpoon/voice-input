@@ -6,9 +6,10 @@ use flate2::write::GzEncoder;
 use flate2::Compression;
 use serde_json::json;
 use std::io::{Read, Write};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use tokio::sync::mpsc::Receiver;
 use tokio::time::timeout;
+use uuid::Uuid;
 
 /// 火山引擎（豆包）Seed ASR 2.0 流式语音识别客户端（V3 协议，单向流式 bigmodel_nostream）。
 ///
@@ -68,7 +69,12 @@ impl AsrClient {
     }
 
     fn header(msg_type: u8, flags: u8) -> [u8; 4] {
-        [0x11, (msg_type << 4) | flags, (SERIALIZATION_JSON << 4) | COMPRESSION_GZIP, 0x00]
+        [
+            0x11,
+            (msg_type << 4) | flags,
+            (SERIALIZATION_JSON << 4) | COMPRESSION_GZIP,
+            0x00,
+        ]
     }
 
     /// 客户端请求帧：4 字节头 + seq(4B) + size(4B) + gzip(payload)
@@ -84,11 +90,7 @@ impl AsrClient {
 
     /// 单向流式识别：消费音频帧，发完最后一包后返回最终文本。
     pub async fn transcribe(&self, mut audio: Receiver<Vec<i16>>) -> Result<String> {
-        let request_id = format!(
-            "{:x}{:x}",
-            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos(),
-            std::process::id()
-        );
+        let request_id = Uuid::new_v4().to_string();
         let url = "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_nostream";
         let headers = [
             ("X-Api-Key", self.api_key.as_str()),
@@ -144,8 +146,13 @@ impl AsrClient {
         }
 
         // 3. 结束标志：最后一包（负 seq + 空音频）
-        ws.send_binary(&Self::request_pkg(MSG_AUDIO_ONLY, FLAG_NEG_WITH_SEQUENCE, -seq, &[])?)
-            .await?;
+        ws.send_binary(&Self::request_pkg(
+            MSG_AUDIO_ONLY,
+            FLAG_NEG_WITH_SEQUENCE,
+            -seq,
+            &[],
+        )?)
+        .await?;
 
         // 4. 收集结果，直到最后一包或超时
         let mut text = String::new();
@@ -153,19 +160,33 @@ impl AsrClient {
         loop {
             let frame = match timeout(deadline, ws.recv()).await {
                 Ok(Ok(Some(f))) => f,
-                Ok(Ok(None)) => { crate::logger::debug("[debug] 服务端关闭连接"); break; }
-                Ok(Err(e)) => return Err(anyhow!("接收 ASR 结果失败: {e}")),
-                Err(_) => { crate::logger::debug(&format!("[debug] 等待响应超时({}s)", deadline.as_secs())); break; }
-            };
-            crate::logger::debug(&format!("[debug] 收到帧 {} 字节: {}", frame.len(),
-                frame.iter().take(16).map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ")));
-            match parse_server_frame(&frame) {
-                Some(ServerMsg::Error(detail)) => {
-                    return Err(anyhow!("ASR 协议错误: {detail}"))
+                Ok(Ok(None)) => {
+                    crate::logger::debug("[debug] 服务端关闭连接");
+                    break;
                 }
+                Ok(Err(e)) => return Err(anyhow!("接收 ASR 结果失败: {e}")),
+                Err(_) => {
+                    crate::logger::debug(&format!("[debug] 等待响应超时({}s)", deadline.as_secs()));
+                    break;
+                }
+            };
+            crate::logger::debug(&format!(
+                "[debug] 收到帧 {} 字节: {}",
+                frame.len(),
+                frame
+                    .iter()
+                    .take(16)
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            ));
+            match parse_server_frame(&frame) {
+                Some(ServerMsg::Error(detail)) => return Err(anyhow!("ASR 协议错误: {detail}")),
                 Some(ServerMsg::Result { is_last, body }) => {
-                    crate::logger::debug(&format!("[debug] ASR 响应(is_last={is_last}): {}",
-                        String::from_utf8_lossy(&body)));
+                    crate::logger::debug(&format!(
+                        "[debug] ASR 响应(is_last={is_last}): {}",
+                        String::from_utf8_lossy(&body)
+                    ));
                     let v: serde_json::Value = match serde_json::from_slice(&body) {
                         Ok(v) => v,
                         Err(e) => return Err(anyhow!("解析 ASR 响应失败: {e}")),
@@ -191,7 +212,9 @@ impl AsrClient {
                         break;
                     }
                 }
-                None => { crate::logger::debug("[debug] 帧解析失败，跳过"); }
+                None => {
+                    crate::logger::debug("[debug] 帧解析失败，跳过");
+                }
             }
         }
         Ok(text)
@@ -243,4 +266,46 @@ fn parse_server_frame(frame: &[u8]) -> Option<ServerMsg> {
         is_last: flags & 0x02 != 0,
         body,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_package_contains_big_endian_sequence_and_payload_size() {
+        let payload = br#"{"ok":true}"#;
+        let frame = AsrClient::request_pkg(MSG_FULL_REQUEST, FLAG_POS_SEQUENCE, 7, payload)
+            .expect("request package should be created");
+        assert_eq!(&frame[..4], &[0x11, 0x11, 0x11, 0x00]);
+        assert_eq!(&frame[4..8], &7i32.to_be_bytes());
+        let size = u32::from_be_bytes(frame[8..12].try_into().unwrap()) as usize;
+        assert_eq!(frame.len(), 12 + size);
+        assert_eq!(AsrClient::gunzip(&frame[12..]).unwrap(), payload);
+    }
+
+    #[test]
+    fn parses_compressed_last_response() {
+        let body = br#"{"result":{"text":"hello"}}"#;
+        let compressed = AsrClient::gzip(body).unwrap();
+        let mut frame = vec![0x11, (MSG_SERVER_FULL_RESPONSE << 4) | 0x02, 0x11, 0x00];
+        frame.extend_from_slice(&(compressed.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&compressed);
+
+        match parse_server_frame(&frame) {
+            Some(ServerMsg::Result {
+                is_last,
+                body: parsed,
+            }) => {
+                assert!(is_last);
+                assert_eq!(parsed, body);
+            }
+            _ => panic!("expected compressed result"),
+        }
+    }
+
+    #[test]
+    fn rejects_truncated_response() {
+        assert!(parse_server_frame(&[0x11, 0x92, 0x11, 0x00, 0, 0, 0, 20]).is_none());
+    }
 }

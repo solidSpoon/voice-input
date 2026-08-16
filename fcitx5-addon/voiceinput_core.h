@@ -10,9 +10,9 @@ extern "C" {
 /* 识别结果回调：text 为 UTF-8，仅在回调期间有效，必须立即拷贝；失败/空结果为 NULL */
 typedef void (*vi_callback)(const char *text, void *user_data);
 
-/* 初始化：加载配置、创建 runtime。返回 0 成功，负值失败 */
+/* 初始化：加载配置、创建 runtime。返回 0 成功；负值失败（-3 表示已初始化） */
 int vi_init(void);
-/* 释放核心库状态 */
+/* 释放核心库状态；会停止录音并等待录音线程退出 */
 int vi_shutdown(void);
 /* 设置回调（可传 NULL 取消） */
 void vi_set_callback(vi_callback cb, void *user_data);

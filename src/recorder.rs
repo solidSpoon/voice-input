@@ -1,6 +1,6 @@
-use anyhow::{Context, Result};
-use alsa::pcm::{Access, Format, HwParams, PCM, State};
+use alsa::pcm::{Access, Format, HwParams, State, PCM};
 use alsa::{Direction, ValueOr};
+use anyhow::{anyhow, Context, Result};
 use std::sync::mpsc::Receiver;
 use std::time::Duration;
 use tokio::sync::mpsc::Sender;
@@ -12,8 +12,7 @@ use tokio::sync::mpsc::Sender;
 /// 因此改用 alsa crate 直接读写 PCM（与 arecord 同一条路径，实测可靠）。
 /// "default" 设备走 PipeWire/PulseAudio 插件，内部自动做采样率转换。
 pub fn record(rate: u32, tx: Sender<Vec<i16>>, stop: Receiver<()>) -> Result<()> {
-    let pcm = PCM::new("default", Direction::Capture, false)
-        .context("打开 ALSA 录音设备失败")?;
+    let pcm = PCM::new("default", Direction::Capture, true).context("打开 ALSA 录音设备失败")?;
     let hwp = HwParams::any(&pcm).context("获取硬件参数失败")?;
     hwp.set_channels(1)?;
     hwp.set_rate_near(rate, ValueOr::Nearest)?;
@@ -24,7 +23,9 @@ pub fn record(rate: u32, tx: Sender<Vec<i16>>, stop: Receiver<()>) -> Result<()>
     pcm.hw_params(&hwp).context("应用硬件参数失败")?;
     let actual_rate = hwp.get_rate()?;
     if actual_rate != rate {
-        eprintln!("录音采样率 {actual_rate}Hz（请求 {rate}Hz）");
+        return Err(anyhow!(
+            "录音设备只提供 {actual_rate}Hz，无法满足请求的 {rate}Hz"
+        ));
     }
     pcm.prepare().context("准备录音失败")?;
 
@@ -56,6 +57,9 @@ pub fn record(rate: u32, tx: Sender<Vec<i16>>, stop: Receiver<()>) -> Result<()>
             }
         }
     }
-    crate::logger::debug(&format!("[debug] 录音结束: 共 {total} 采样 ({:.2} 秒)", total as f64 / rate as f64));
+    crate::logger::debug(&format!(
+        "[debug] 录音结束: 共 {total} 采样 ({:.2} 秒)",
+        total as f64 / rate as f64
+    ));
     Ok(())
 }

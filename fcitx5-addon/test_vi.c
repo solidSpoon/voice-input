@@ -18,7 +18,9 @@ static void on_result(const char *text, void *user) {
 }
 
 int main(void) {
-    printf("vi_init = %d\n", vi_init());
+    int init = vi_init();
+    printf("vi_init = %d\n", init);
+    if (init != 0) return 1;
     vi_set_callback(on_result, NULL);
     printf("vi_state = %d (期望 0=空闲)\n", vi_state());
 
@@ -30,8 +32,10 @@ int main(void) {
     printf("录音中，请说话 3 秒...\n");
     sleep(3);
 
-    printf("vi_stop = %d (期望 0)\n", vi_stop());
-    printf("vi_state = %d (期望 2=等待结果)\n", vi_state());
+    int stop_state = vi_state();
+    int stop_result = stop_state == 1 ? vi_stop() : 0;
+    printf("vi_stop = %d (录音状态为 1 时应为 0，当前状态 %d)\n", stop_result,
+           stop_state);
 
     int waited = 0;
     while (!done && waited < 15000) {

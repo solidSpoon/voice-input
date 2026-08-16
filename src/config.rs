@@ -38,6 +38,12 @@ impl Config {
         let s = fs::read_to_string(&path)
             .with_context(|| format!("读取配置失败: {}", path.display()))?;
         let cfg: Config = toml::from_str(&s).map_err(|e| anyhow!("解析配置失败: {e}"))?;
+        if cfg.asr.rate != 16_000 {
+            return Err(anyhow!(
+                "不支持的采样率 {}，目前只支持 16000Hz",
+                cfg.asr.rate
+            ));
+        }
         Ok(cfg)
     }
 }

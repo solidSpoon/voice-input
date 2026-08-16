@@ -43,6 +43,15 @@ namespace {
 
 // 简易日志：~/.local/share/voice-input/plugin.log（fcitx5 的 stderr 不可见）
 // 保留策略：只留最近 7 天（*.log*），单文件超过 1MB 轮转到 .1，每小时清理一次
+std::string viTimestamp() {
+    std::time_t now = std::time(nullptr);
+    std::tm local{};
+    localtime_r(&now, &local);
+    char buffer[32]{};
+    std::strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", &local);
+    return buffer;
+}
+
 void viLog(const std::string &msg) {
     const char *home = getenv("HOME");
     if (!home) {
@@ -89,7 +98,7 @@ void viLog(const std::string &msg) {
 
     FILE *f = fopen(file.c_str(), "a");
     if (f) {
-        fprintf(f, "%s\n", msg.c_str());
+        fprintf(f, "[%s] %s\n", viTimestamp().c_str(), msg.c_str());
         fclose(f);
     }
 }
@@ -152,13 +161,20 @@ private:
             if (!keyEvent.isRelease()) {
                 // 按下：开始录音（含自动重复的 press，一律吞掉不外泄）
                 if (!recording_ && vi_state() == 0) {
-                    recording_ = true;
-                    recordingStart_ = std::chrono::steady_clock::now();
-                    pendingIcUuid_ = ic->uuid();
                     int rc = vi_start();
                     viLog("按键: 按下右 Ctrl 开始录音 rc=" +
                           std::to_string(rc));
-                    setAux(ic, "🎤 录音中…");
+                    if (rc == 0) {
+                        {
+                            std::lock_guard<std::mutex> lock(resultMutex_);
+                            resultBuffer_.clear();
+                            resultReady_ = false;
+                        }
+                        recording_ = true;
+                        recordingStart_ = std::chrono::steady_clock::now();
+                        pendingIcUuid_ = ic->uuid();
+                        setAux(ic, "🎤 录音中…");
+                    }
                 }
                 keyEvent.filterAndAccept();
                 return true;
@@ -169,7 +185,11 @@ private:
                 recording_ = false;
                 int rc = vi_stop();
                 viLog("按键: 松开右 Ctrl 停止录音 rc=" + std::to_string(rc));
-                setAux(ic, "🔍 识别中…");
+                if (rc == 0) {
+                    setAux(ic, "🔍 识别中…");
+                } else {
+                    setAux(ic, "");
+                }
             }
             keyEvent.filterAndAccept();
             return true;
@@ -183,6 +203,7 @@ private:
         {
             std::lock_guard<std::mutex> lock(self->resultMutex_);
             self->resultBuffer_ = text ? std::string(text) : std::string();
+            self->resultReady_ = true;
         }
         viLog("回调: 收到结果 text=" +
               (text ? std::string(text) : std::string("(NULL)")));
@@ -209,11 +230,12 @@ private:
         std::string text;
         {
             std::lock_guard<std::mutex> lock(resultMutex_);
-            if (resultBuffer_.empty()) {
+            if (!resultReady_) {
                 return;
             }
             text = std::move(resultBuffer_);
             resultBuffer_.clear();
+            resultReady_ = false;
         }
         viLog("轮询: 取到结果: " + text);
         auto *ic = instance_->inputContextManager().findByUUID(pendingIcUuid_);
@@ -239,6 +261,7 @@ private:
     std::unique_ptr<EventSourceTime> pollTimer_;
     std::mutex resultMutex_;
     std::string resultBuffer_;
+    bool resultReady_ = false;
     bool recording_ = false;
     std::chrono::steady_clock::time_point recordingStart_{};
     ICUUID pendingIcUuid_{};

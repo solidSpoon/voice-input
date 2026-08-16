@@ -75,7 +75,7 @@ sudo cmake --install fcitx5-addon/build
 [asr]
 api_key = "你的 API Key"
 resource_id = "volc.seedasr.sauc.duration"  # 2.0 小时版
-rate = 16000
+rate = 16000  # 目前只支持 16000Hz
 ```
 
 API Key 在[火山引擎控制台](https://console.volcengine.com/speech/new/setting/apikeys)「API Key 管理」创建。
@@ -84,8 +84,9 @@ API Key 在[火山引擎控制台](https://console.volcengine.com/speech/new/set
 
 - 按住**右 Ctrl** 说话，松开后识别结果出现在当前输入位置；录音/识别中候选框旁有状态提示
 - 热键暂为硬编码，TODO：做成 fcitx5 配置项
-- 调试日志：`~/.local/share/voice-input/debug.log`（Rust 核心）、`plugin.log`（插件）
+- 调试日志：`~/.local/share/voice-input/debug.log`（Rust 核心）、`plugin.log`（插件），每条记录带本地时间
 - 日志保留策略：只留最近 **7 天**，单文件超 **1MB** 自动轮转到 `.1`（每小时检查一次）
+- 核心库关闭时会停止并等待录音线程，避免重载插件后残留麦克风占用
 
 ## 说明
 
